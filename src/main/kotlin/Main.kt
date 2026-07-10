@@ -16,7 +16,7 @@ import java.util.concurrent.TimeUnit
 import com.google.gson.reflect.TypeToken
 import java.io.File
 
-const val OPENAI_API_KEY = System.getenv("OPENAI_API_KEY") ?: ""
+val OPENAI_API_KEY = System.getenv("OPENAI_API_KEY") ?: ""
 const val SESSION_DURATION_MS = 24 * 60 * 60 * 1000L // 24 часа в миллисекундах
 
 val httpClient = OkHttpClient.Builder()
@@ -44,7 +44,7 @@ fun main() {
     println("HR-бот запущен. Ограничение сессии: 24 часа.")
 
     val telegramBot = bot {
-        token = ""
+        token = System.getenv("TELEGRAM_BOT_TOKEN") ?: ""
 
         dispatch {
             addHandler(object : Handler {
@@ -148,15 +148,13 @@ suspend fun generateSmartResponse(candidate: CandidateData, userText: String): S
 }
 
 fun getReferenceFromDocx(candidate: CandidateData): String {
-    val faqBase = """
-        FAQ ИЗ ДОКУМЕНТА:
-        - Договор: для стажировки не нужен (творческие проекты). Подписываем только на коммерцию.
-        - Оплата программ ИИ: используйте бесплатные генерации, потом можем оплатить подписку для доработок.
-        - График работы: ~8 часов в день, зависит от проекта.
-        - Кто обучает: Дмитрий Кориков.
-        - Можно ли совмещать: Да.
-        - Зарплата: После стажировки работаем по TFP, коммерческие проекты оплачиваются после продажи (х3).
-    """.trimIndent()
+    val faqFile = File("faq.txt")
+
+    val faqBase = if (faqFile.exists()) {
+        "FAQ ИЗ ДОКУМЕНТА:\n" + faqFile.readText()
+    } else {
+        "ВНИМАНИЕ: Файл базы знаний (faq.txt) не найден на сервере! Отвечай только на основе общих знаний."
+    }
 
     return when (candidate.state) {
         UserState.NEW -> {
