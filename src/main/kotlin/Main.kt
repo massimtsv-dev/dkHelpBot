@@ -5,9 +5,11 @@ import com.github.kotlintelegrambot.dispatcher.handlers.Handler
 import com.github.kotlintelegrambot.dispatcher.telegramError
 import com.github.kotlintelegrambot.entities.ChatId
 import com.github.kotlintelegrambot.entities.Update
+import com.github.kotlintelegrambot.entities.ChatAction
 import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -16,6 +18,7 @@ import java.util.concurrent.TimeUnit
 import com.google.gson.reflect.TypeToken
 import java.io.File
 
+val TELEGRAM_BOT_TOKEN = System.getenv("TELEGRAM_BOT_TOKEN") ?: ""
 val OPENAI_API_KEY = System.getenv("OPENAI_API_KEY") ?: ""
 const val SESSION_DURATION_MS = 24 * 60 * 60 * 1000L // 24 часа в миллисекундах
 
@@ -33,18 +36,18 @@ data class CandidateData(
     var state: UserState = UserState.NEW,
     var profession: Profession = Profession.UNKNOWN,
     var chatHistory: MutableList<GptMessage> = mutableListOf(),
-    val firstMessageTime: Long = System.currentTimeMillis() // Время старта сессии
+    val firstMessageTime: Long = System.currentTimeMillis(), // Время старта сессии
+    var humanRequired: Boolean = false // Флаг передачи диалога человеку
 )
 
 val candidatesDb = mutableMapOf<Long, CandidateData>()
 
 fun main() {
-
     loadDatabase()
     println("HR-бот запущен. Ограничение сессии: 24 часа.")
 
     val telegramBot = bot {
-        token = System.getenv("TELEGRAM_BOT_TOKEN") ?: ""
+        token = TELEGRAM_BOT_TOKEN
 
         dispatch {
             addHandler(object : Handler {
@@ -58,10 +61,16 @@ fun main() {
 
                     if (senderId != chatIdLong) return
 
-                    // --- ПРОВЕРКА ВРЕМЕНИ (24 ЧАСА) ---
                     val candidate = candidatesDb.getOrPut(chatIdLong) { CandidateData() }
-                    val currentTime = System.currentTimeMillis()
 
+                    // --- ПРОВЕРКА: ЕСЛИ ДИАЛОГ УЖЕ ПЕРЕДАН ЧЕЛОВЕКУ ИЛИ ЗАВЕРШЕН ---
+                    if (candidate.humanRequired || candidate.state == UserState.FINISHED) {
+                        println("Диалог $chatIdLong игнорируется: передан человеку или успешно завершен.")
+                        return
+                    }
+
+                    // --- ПРОВЕРКА ВРЕМЕНИ (24 ЧАСА) ---
+                    val currentTime = System.currentTimeMillis()
                     if (currentTime - candidate.firstMessageTime > SESSION_DURATION_MS) {
                         println("Сессия для пользователя $chatIdLong истекла.")
                         return
@@ -70,11 +79,32 @@ fun main() {
                     val chatId = ChatId.fromId(chatIdLong)
                     val bizConnectionId = bizMessage.businessConnectionId
 
-                    updateCandidateState(candidate, text.lowercase())
+                    // Обновляем состояние воронки (с контекстом истории)
+                    updateCandidateState(candidate, text)
 
-                    val gptAnswer = generateSmartResponse(candidate, text)
+                    // Генерируем ответ. Если вернулся null (ошибка/сбой сети) — молча игнорируем сообщение
+                    val gptAnswer = generateSmartResponse(candidate, text) ?: return
 
-                    bot.sendMessage(chatId = chatId, businessConnectionId = bizConnectionId, text = gptAnswer)
+                    // Обрабатываем запрос на передачу человеку
+                    val finalAnswer = if (gptAnswer.contains("[HUMAN_REQUIRED]")) {
+                        candidate.humanRequired = true
+                        gptAnswer.replace("[HUMAN_REQUIRED]", "").trim()
+                    } else {
+                        gptAnswer
+                    }
+
+                    // --- ИМИТАЦИЯ ПЕЧАТАНИЯ ---
+                    val delayMs = (finalAnswer.length * 40L).coerceIn(1500L, 7000L)
+                    bot.sendChatAction(chatId = chatId, action = ChatAction.TYPING)
+                    if (delayMs > 5000L) {
+                        delay(4000L)
+                        bot.sendChatAction(chatId = chatId, action = ChatAction.TYPING)
+                        delay(delayMs - 4000L)
+                    } else {
+                        delay(delayMs)
+                    }
+
+                    bot.sendMessage(chatId = chatId, businessConnectionId = bizConnectionId, text = finalAnswer)
 
                     saveDatabase()
                 }
@@ -99,11 +129,19 @@ suspend fun updateCandidateState(candidate: CandidateData, text: String) {
             }
         }
         UserState.WAITING_FOR_FORM -> {
-            val isAgreed = checkIntentWithGPT(text, "Пользователь сообщает, что заполнил гугл-форму, согласен на условия или готов к тесту?")
+            val isAgreed = checkIntentWithGPT(
+                text,
+                "Пользователь сообщает, что заполнил гугл-форму, согласен на условия или готов к тесту?",
+                candidate.chatHistory
+            )
             if (isAgreed) candidate.state = UserState.WAITING_FOR_TEST
         }
         UserState.WAITING_FOR_TEST -> {
-            val isDone = checkIntentWithGPT(text, "Пользователь отправил ссылку на работу, файл или сообщает, что выполнил тестовое задание?")
+            val isDone = checkIntentWithGPT(
+                text,
+                "Пользователь отправил ссылку на работу, файл или сообщает, что выполнил тестовое задание?",
+                candidate.chatHistory
+            )
             if (isDone) candidate.state = UserState.FINISHED
         }
         UserState.FINISHED -> { /* Конец воронки */ }
@@ -112,7 +150,7 @@ suspend fun updateCandidateState(candidate: CandidateData, text: String) {
 
 // ================= ИНТЕГРАЦИЯ ДОКУМЕНТА, ПАМЯТИ И AI =================
 
-suspend fun generateSmartResponse(candidate: CandidateData, userText: String): String {
+suspend fun generateSmartResponse(candidate: CandidateData, userText: String): String? {
     val referenceInfo = getReferenceFromDocx(candidate)
 
     val systemPrompt = """
@@ -124,24 +162,27 @@ suspend fun generateSmartResponse(candidate: CandidateData, userText: String): S
         ----------------------------------------------
         
         ПРАВИЛА ОТВЕТА (ВЫПОЛНЯТЬ СТРОГО!):
-        1. Отвечай кратко (1-3 предложения), используй разговорный стиль.
-        2. Обязательно ответь на вопрос человека, если он его задал, используя факты из справочника.
-        3. НИКОГДА не здоровайся повторно, если это не первое сообщение в диалоге! Продолжай беседу естественно.
-        4. ПРАВИЛА ДЛЯ ССЫЛОК (КРИТИЧЕСКИ ВАЖНО):
+        1. Отвечай кратко (1-3 предложения), используй разговорный, но уважительный стиль.
+        2. ОБРАЩЕНИЕ НА «ВЫ»: Ко всем кандидатам обращайся СТРОГО на «Вы» (с заглавной буквы «В»: Вы, Вас, Вам, Ваш). Используй уважительные глагольные формы во множественном числе (например: "Вы заполнили", "напишите", "сделайте"). Любое обращение на "ты" категорически запрещено!
+        3. Обязательно ответь на вопрос человека, если он его задал, используя факты из справочника.
+        4. НИКОГДА не здоровайся повторно, если это не первое сообщение в диалоге! Продолжай беседу естественно.
+        5. ПРАВИЛА ДЛЯ ССЫЛОК (КРИТИЧЕСКИ ВАЖНО):
            - Бери ссылки ТОЛЬКО из блока "СПРАВОЧНАЯ ИНФОРМАЦИЯ". Не придумывай свои!
            - Выводи ссылки ПОЛНОСТЬЮ открытым текстом. 
            - ЗАПРЕЩЕНО использовать формат Markdown (без квадратных и круглых скобок).
            - Просто вставь ссылку в текст как она есть.
-        5. НИКОГДА не говори, что ты ИИ.
+        6. НИКОГДА не говори, что ты ИИ.
+        7. ЕСЛИ НЕ ЗНАЕШЬ ОТВЕТА: Если кандидат задает вопрос, информации о котором НЕТ в справочной информации, или ты не знаешь, что ответить, начни свой ответ СТРОГО со специального тега '[HUMAN_REQUIRED]'.
+           Пример ответа: "[HUMAN_REQUIRED] К сожалению, я не владею этой информацией. Сейчас позову нашего специалиста, он ответит Вам подробно!"
     """.trimIndent()
 
-    val gptAnswer = sendRequestToOpenAI(systemPrompt, userText, candidate.chatHistory)
+    val gptAnswer = sendRequestToOpenAI(systemPrompt, userText, candidate.chatHistory) ?: return null
 
     candidate.chatHistory.add(GptMessage("user", userText))
     candidate.chatHistory.add(GptMessage("assistant", gptAnswer))
 
-    if (candidate.chatHistory.size > 8) {
-        candidate.chatHistory = candidate.chatHistory.drop(candidate.chatHistory.size - 8).toMutableList()
+    if (candidate.chatHistory.size > 12) {
+        candidate.chatHistory = candidate.chatHistory.drop(candidate.chatHistory.size - 12).toMutableList()
     }
 
     return gptAnswer
@@ -158,22 +199,22 @@ fun getReferenceFromDocx(candidate: CandidateData): String {
 
     return when (candidate.state) {
         UserState.NEW -> {
-            "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат пока не назвал точную вакансию. Ответь на его вопросы (если есть) и мягко спроси, на какую должность он откликался на HH.ru, чтобы ты мог выслать детали."
+            "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат пока не назвал точную вакансию. Ответьте на его вопросы (если есть) и мягко спросите, на какую должность он откликался на HH.ru, чтобы Вы могли выслать детали."
         }
         UserState.WAITING_FOR_FORM -> {
             val profName = candidate.profession.name
-            "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат идет на должность: $profName. Обязательно расскажи, что вы студия из Лос-Анджелеса, обучение бесплатное, и попроси его заполнить Гугл Форму: https://docs.google.com/forms/d/e/1FAIpQLSfxrgtk4V3r_L5CJxdbe2wAbZF2yTvVvdJPh3X4bxnl2Jwgkg/viewform?usp=dialog. Попроси написать, как заполнит. Упомяни аудио-информацию: https://drive.google.com/drive/folders/1yKY8qeVrvKnB7EB6LguuR25O5I37D9kQ?usp=drive_link"
+            "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат идет на должность: $profName. Обязательно расскажите, что вы студия из Лос-Анджелеса, обучение бесплатное, и попросите его заполнить Гугл Форму: https://docs.google.com/forms/d/e/1FAIpQLSfxrgtk4V3r_L5CJxdbe2wAbZF2yTvVvdJPh3X4bxnl2Jwgkg/viewform?usp=dialog. Попросите написать, как заполнит. Упомяните аудио-информацию: https://drive.google.com/drive/folders/1yKY8qeVrvKnB7EB6LguuR25O5I37D9kQ?usp=drive_link"
         }
         UserState.WAITING_FOR_TEST -> {
             val testTask = getTestTaskStrict(candidate.profession)
             if (testTask != null) {
-                "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат заполнил форму. Поблагодари его и выдай тестовое задание. Точные данные задания (ОБЯЗАТЕЛЬНО ОТПРАВЬ ЭТУ ССЫЛКУ): $testTask"
+                "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат заполнил форму. Поблагодарите его и выдайте тестовое задание. Точные данные задания (ОБЯЗАТЕЛЬНО ОТПРАВЬТЕ ЭТУ ССЫЛКУ): $testTask"
             } else {
-                "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат заполнил форму. Скажи, что передал его кандидатуру специалисту и скоро с ним свяжутся для созвона в Google Meet."
+                "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат заполнил форму. Скажите, что передали его кандидатуру специалисту и скоро с ним свяжутся для созвона в Google Meet."
             }
         }
         UserState.FINISHED -> {
-            "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат всё сдал. Скажи, что его работа проверяется, и попроси ожидать обратной связи от специалистов."
+            "$faqBase\nИНСТРУКЦИЯ ДЛЯ ТЕКУЩЕГО ШАГА: Кандидат всё сдал. Скажите, что его работа проверяется, и попросите ожидать обратной связи от специалистов."
         }
     }
 }
@@ -182,7 +223,7 @@ fun getTestTaskStrict(prof: Profession): String? {
     return when (prof) {
         Profession.SCREENWRITER -> "Ссылка: https://drive.google.com/drive/folders/1ejZWjUsli0RAUSFxG7UD30BgktX8v7l-?usp=sharing. Дедлайн 1-2 недели."
         Profession.DIRECTOR -> "Нужно прочесть «Спасите котика!» и «Путешествие Писателя». Ссылка: https://1drv.ms/f/s!AuzaU4Gs1DMUwy7S5SFBAmHmabwQ?e=D4f2ve. Дедлайн 1-2 недели."
-        Profession.WEB_DEV -> "Проанализировать сайты incubator.dkfilms.tv и dkfilms.tv. Дедлайн 3 дня."
+        Profession.WEB_DEV -> "Проанализировать сайты incubator.dkfilms.tv and dkfilms.tv. Дедлайн 3 дня."
         Profession.EDITOR -> "Ссылка на материалы: https://drive.google.com/drive/folders/1EaJy01YKrQ6nYgmx3m3FVWytNEjk4rhw. Дедлайн 7 дней."
         Profession.AI_CREATOR -> "Ссылка на материалы: https://drive.google.com/drive/folders/1juYhiegOwAjcub7DH4DiaFxgIOWcxhAY. Дедлайн 7 дней."
         Profession.RESEARCHER -> "Ссылка на материалы: https://drive.google.com/drive/folders/1g0d4ZNu6_nmmxVPcu9hnvCrNJmjPNJX-. Дедлайн 7 дней."
@@ -202,9 +243,22 @@ data class GptRequest(
 data class GptResponse(val choices: List<Choice>)
 data class Choice(val message: GptMessage)
 
-suspend fun checkIntentWithGPT(userText: String, question: String): Boolean {
-    val prompt = "Вопрос: $question\nЕсли ДА, пиши YES. Если НЕТ, пиши NO."
-    val response = sendRequestToOpenAI(prompt, userText)
+suspend fun checkIntentWithGPT(userText: String, question: String, chatHistory: List<GptMessage> = emptyList()): Boolean {
+    val historyContext = if (chatHistory.isEmpty()) "История пуста." else chatHistory.joinToString("\n") { "${it.role}: ${it.content}" }
+    val prompt = """
+        Ты — беспристрастный классификатор интента (намерений) пользователя.
+        Изучи историю диалога и последнее сообщение соискателя, чтобы точно понять контекст.
+        
+        История диалога:
+        $historyContext
+        
+        Последнее сообщение пользователя: $userText
+        
+        Вопрос: $question
+        Ответь СТРОГО одним словом: YES (если ответ на вопрос утвердительный) или NO (если отрицательный или информации недостаточно).
+    """.trimIndent()
+
+    val response = sendRequestToOpenAI(prompt, userText) ?: ""
     return response.contains("YES", ignoreCase = true)
 }
 
@@ -212,7 +266,7 @@ suspend fun sendRequestToOpenAI(
     systemPrompt: String,
     userText: String,
     chatHistory: List<GptMessage> = emptyList()
-): String {
+): String? {
     return withContext(Dispatchers.IO) {
         try {
             val requestMessages = mutableListOf<GptMessage>()
@@ -236,12 +290,12 @@ suspend fun sendRequestToOpenAI(
 
             if (response.isSuccessful && responseBody != null) {
                 val gptResponse = gson.fromJson(responseBody, GptResponse::class.java)
-                return@withContext gptResponse.choices.firstOrNull()?.message?.content ?: "Уточняю данные..."
+                return@withContext gptResponse.choices.firstOrNull()?.message?.content
             } else {
-                return@withContext "Дай минутку, сверяюсь с информацией..."
+                return@withContext null
             }
         } catch (e: Exception) {
-            return@withContext "Интернет немного подводит, повтори, пожалуйста."
+            return@withContext null
         }
     }
 }
@@ -275,24 +329,25 @@ fun loadDatabase() {
 
 // ================= УТИЛИТЫ =================
 fun detectProfession(text: String): Profession {
+    val lowerText = text.lowercase()
     return when {
-        text.contains("монтаж") || text.contains("editor") -> Profession.EDITOR
-        text.contains("сценарист") || text.contains("writer") -> Profession.SCREENWRITER
-        text.contains("дизайнер") -> Profession.DESIGNER
-        text.contains("ai") || text.contains("ии") -> Profession.AI_CREATOR
-        text.contains("ресерчер") -> Profession.RESEARCHER
-        text.contains("цветокор") -> Profession.COLORIST
-        text.contains("верстал") -> Profession.WEB_DEV
-        text.contains("режиссер") -> Profession.DIRECTOR
-        text.contains("публицист") -> Profession.PUBLICIST
-        text.contains("нетворкинг") -> Profession.NETWORKING
-        text.contains("академ") -> Profession.ACADEMY_MANAGER
-        text.contains("моушн") -> Profession.MOTION_DESIGNER
-        text.contains("продаж") -> Profession.SALES
-        text.contains("ретушер") -> Profession.RETOUCHER
-        text.contains("инвестор") -> Profession.INVESTOR
-        text.contains("таргетолог") -> Profession.TARGETOLOGIST
-        text.contains("путешеств") -> Profession.TRAVEL
+        lowerText.contains("монтаж") || lowerText.contains("editor") -> Profession.EDITOR
+        lowerText.contains("сценарист") || lowerText.contains("writer") -> Profession.SCREENWRITER
+        lowerText.contains("дизайнер") -> Profession.DESIGNER
+        lowerText.contains("ai") || lowerText.contains("ии") -> Profession.AI_CREATOR
+        lowerText.contains("ресерчер") -> Profession.RESEARCHER
+        lowerText.contains("цветокор") -> Profession.COLORIST
+        lowerText.contains("верстал") -> Profession.WEB_DEV
+        lowerText.contains("режиссер") -> Profession.DIRECTOR
+        lowerText.contains("публицист") -> Profession.PUBLICIST
+        lowerText.contains("нетворкинг") -> Profession.NETWORKING
+        lowerText.contains("академ") -> Profession.ACADEMY_MANAGER
+        lowerText.contains("моушн") -> Profession.MOTION_DESIGNER
+        lowerText.contains("продаж") -> Profession.SALES
+        lowerText.contains("ретушер") -> Profession.RETOUCHER
+        lowerText.contains("инвестор") -> Profession.INVESTOR
+        lowerText.contains("таргетолог") -> Profession.TARGETOLOGIST
+        lowerText.contains("путешеств") -> Profession.TRAVEL
         else -> Profession.UNKNOWN
     }
 }
