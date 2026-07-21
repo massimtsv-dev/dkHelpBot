@@ -56,6 +56,17 @@ fun main() {
                 override suspend fun handleUpdate(bot: Bot, update: Update) {
                     val bizMessage = update.businessMessage ?: return
                     val text = bizMessage.text ?: return
+
+// ================= ЗАЩИТА ОТ СТАРЫХ СООБЩЕНИЙ ИЗ ОФЛАЙНА =================
+                    val messageTimeSeconds = bizMessage.date // Время отправки сообщения соискателем
+                    val currentTimeSeconds = System.currentTimeMillis() / 1000 // Текущее время сервера
+
+// Если сообщение отправлено более 180 секунд (3 минут) назад — молча пропускаем
+                    if (currentTimeSeconds - messageTimeSeconds > 180) {
+                        println("Сообщение из офлайна от чата ${bizMessage.chat.id} пропущено (отправлено ${currentTimeSeconds - messageTimeSeconds} сек. назад)")
+                        return
+                    }
+
                     val chatIdLong = bizMessage.chat.id
                     val senderId = bizMessage.from?.id
 
@@ -236,7 +247,7 @@ fun getTestTaskStrict(prof: Profession): String? {
 
 data class GptMessage(val role: String, val content: String)
 data class GptRequest(
-    val model: String = "gpt-3.5-turbo",
+    val model: String = "gpt-4o-mini",
     val temperature: Double = 0.7,
     val messages: List<GptMessage>
 )
